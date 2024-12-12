@@ -5,6 +5,7 @@ from sklearn.neighbors import NearestNeighbors
 import ast
 
 
+
 #todo: get an input genre list from user's spotify playlist/song
 
 def clean(df):
@@ -110,10 +111,19 @@ def recommend_artists(input_genres, artist_df, exclude_artists=None, n_recommend
         'all_genres': all_unique_genres
     }
 
+def prepare_artist_data(filename):
+    tracks = pd.read_csv(filename, nrows=10000)
+    #print("Available columns:", tracks.columns.tolist())
+    tracks = tracks.drop(columns=['Unnamed: 0', 'popularity', 'album_type', 'is_playable', 'release_date',  'playlist_uris'])
+    tracks.head()
+
+    #todo: for each artist url, query spotify api and get genre list. add to new column ['genres']
+
 def main():
     # Load the dataset
-    df = pd.read_csv("artists.csv")
     
+    df = pd.read_csv("artists.csv")
+    prepare_artist_data("final_tracks.csv")
     # Create genre preferences
     genre_preferences = ['pop', 'pop', 'rock', 'hyperpop_italiano', 'hyperpop_italiano', 'indie pop', 'indie pop', 'uk bass', 'uk bass']
     
@@ -126,7 +136,7 @@ def main():
                                   recommendations['distances']):
             print(f"Artist URI: {artist}, Distance: {distance:.3f}")
 
-        #genre info   
+         #genre info   
         print(f"\nTotal unique genres: {len(recommendations['all_genres'])}")
         print(f"All genres: {recommendations['all_genres']}")
 
