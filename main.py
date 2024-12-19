@@ -8,6 +8,8 @@ import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 import dotenv
 
+from api import *
+
 dotenv.load_dotenv()
 
 
@@ -208,6 +210,140 @@ def prepare_artist_data(filename):
     tracks.head()
 
     #todo: for each artist url, query spotify api and get genre list. add to new column ['genres']
+
+def get_track_features(sp, track_id):
+    """
+    Get audio features and basic track info from Spotify API
+    """
+    try:
+        # Get audio features
+        audio_features = sp.audio_features([track_id])[0]
+        # Get track info including popularity
+        track_info = sp.track(track_id)
+        
+        if audio_features:
+            relevant_features = {
+                'danceability': audio_features['danceability'],
+                'energy': audio_features['energy'],
+                'valence': audio_features['valence'],
+                'tempo': audio_features['tempo'],
+                'popularity': track_info['popularity'] / 100.0  # Normalize to 0-1 range
+            }
+            return relevant_features
+    except:
+        return None
+    
+def vectorize_track(track_genres, track_features, all_unique_genres):
+    """
+    Creates a feature vector combining genres and audio features
+    """
+    # Get genre vector (using your existing vectorize_genre_list function)
+    genre_vector = vectorize_genre_list(track_genres, all_unique_genres)
+    
+    # Create feature vector from audio features
+    feature_vector = np.array([
+        track_features['danceability'],
+        track_features['energy'],
+        track_features['valence'],
+        track_features['tempo'] / 200.0,  # Normalize tempo
+        track_features['popularity']
+    ])
+    
+    # Combine genre and feature vectors
+    # You can adjust these weights based on importance
+    genre_weight = 0.7
+    features_weight = 0.3
+    
+    combined_vector = np.concatenate([
+        genre_vector * genre_weight,
+        feature_vector * features_weight
+    ])
+    
+    return combined_vector
+
+def recommend_tracks(input_genres, tracks_df, sp, n_recommendations=5):
+    """
+    Recommends tracks based on input genres and audio features
+    """
+    # Clean data and get unique genres
+    all_unique_genres = extract_unique_genres(tracks_df)
+    
+    # Prepare track vectors
+    track_vectors = []
+    track_ids = []
+    
+    for _, track in tracks_df.iterrows():
+        # Get track features from Spotify API
+        track_features = get_track_features(sp, track['track_uri'].split(':')[-1])
+        if not track_features:
+            continue
+            
+        # Get track's artist genres
+        artist_ids = [artist_uri.split(':')[-1] for artist_uri in ast.literal_eval(track['artist_uris'])]
+        track_genres = []
+        for artist_id in artist_ids:
+            try:
+                artist = sp.artist(artist_id)
+                track_genres.extend(artist['genres'])
+            except:
+                continue
+        
+        if not track_genres:
+            continue
+            
+        # Create combined feature vector
+        track_vector = vectorize_track(track_genres, track_features, all_unique_genres)
+        track_vectors.append(track_vector)
+        track_ids.append(track['track_uri'])
+    
+    # Convert to numpy array
+    track_vectors = np.array(track_vectors)
+    
+    # Create input vector (using first track's features as reference)
+    input_features = get_track_features(sp, track_ids[0].split(':')[-1])
+    input_vector = vectorize_track(input_genres, input_features, all_unique_genres)
+    
+    # Find nearest neighbors
+    n_neighbors = min(len(track_vectors), max(n_recommendations * 2, 5))
+    knn = NearestNeighbors(n_neighbors=n_neighbors, metric='cosine')
+    knn.fit(track_vectors)
+    
+    distances, indices = knn.kneighbors([input_vector])
+    
+    recommended_tracks = []
+    recommendation_distances = []
+    
+    for idx, distance in zip(indices[0], distances[0]):
+        track_uri = track_ids[idx]
+        recommended_tracks.append(track_uri)
+        recommendation_distances.append(distance)
+        if len(recommended_tracks) >= n_recommendations:
+            break
+    
+    return {
+        'recommended_tracks': recommended_tracks,
+        'distances': recommendation_distances,
+        'all_genres': all_unique_genres
+    }
+
+def get_track_names_from_uris(track_uris, sp):
+    """
+    Get track names and artists from URIs
+    """
+    track_info = []
+    
+    for i in range(0, len(track_uris), 50):
+        batch = [uri.split(':')[-1] for uri in track_uris[i:i + 50]]
+        tracks = sp.tracks(batch)['tracks']
+        
+        for track in tracks:
+            track_info.append({
+                'name': track['name'],
+                'artists': ', '.join(artist['name'] for artist in track['artists'])
+            })
+    
+    return track_info
+
 
 def main():
     # Load the dataset
