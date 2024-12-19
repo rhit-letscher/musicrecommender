@@ -3,10 +3,14 @@ import pandas as pd
 from collections import Counter
 from sklearn.neighbors import NearestNeighbors
 import ast
+import os
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
+import dotenv
+
+dotenv.load_dotenv()
 
 
-
-#todo: get an input genre list from user's spotify playlist/song
 
 def clean(df):
     # Convert string representation of list to actual list
@@ -15,10 +19,96 @@ def clean(df):
     cleaned_df = df[df['artist_genres'].apply(len) > 0]
     return cleaned_df
 
+def get_artist_names_from_uris(artist_uris):
+    # Initialize Spotify client
+    # You'll need to set up your credentials at https://developer.spotify.com/dashboard
+    client_credentials_manager = SpotifyClientCredentials(
+        client_id=os.environ.get('SPOTIFY_CLIENT_ID'),
+        client_secret=os.environ.get('SPOTIFY_SECRET')
+    )
+    sp = spotipy.Spotify(client_credentials_manager=client_credentials_manager)
+    
+    # Get artist names from URIs
+    artist_names = []
+    
+    # Process URIs in batches of 50 (Spotify API limit)
+    for i in range(0, len(artist_uris), 50):
+        batch = artist_uris[i:i + 50]
+        artists = sp.artists(batch)['artists']
+        artist_names.extend([artist['name'] for artist in artists])
+    
+    return artist_names
+
+def get_genres_from_playlist(playlist_url: str):
+    """
+    Retrieve all genres from a Spotify playlist through its artists.
+    Returns a list of genres (non-unique to preserve frequency for weighting).
+    
+    Args:
+        playlist_url (str): Full Spotify playlist URL or URI
+        
+    Returns:
+        List[str]: List of all genres (including duplicates)
+    """
+    # Initialize Spotify client
+    client_credentials_manager = SpotifyClientCredentials(
+        client_id=os.environ.get('SPOTIFY_CLIENT_ID'),
+        client_secret=os.environ.get('SPOTIFY_SECRET')
+    )
+    sp = spotipy.Spotify(client_credentials_manager=client_credentials_manager)
+    
+    # Extract playlist ID from URL if needed
+    if 'spotify.com' in playlist_url:
+        playlist_id = playlist_url.split('/')[-1].split('?')[0]
+    else:
+        playlist_id = playlist_url
+    
+    # Get all tracks from playlist
+    all_genres = []
+    offset = 0
+    batch_size = 100  # Spotify API limit for tracks per request
+    
+    while True:
+        # Get batch of tracks
+        results = sp.playlist_tracks(
+            playlist_id,
+            offset=offset,
+            fields='items.track.artists,total',
+            additional_types=['track']
+        )
+        
+        if not results['items']:
+            break
+            
+        # Extract artist IDs from the batch
+        artist_ids = []
+        for item in results['items']:
+            if item['track'] and item['track']['artists']:
+                artist_ids.extend([artist['id'] for artist in item['track']['artists']])
+        
+        # Get artist details in batches of 50 (Spotify API limit)
+        for i in range(0, len(artist_ids), 50):
+            artist_batch = artist_ids[i:i+50]
+            artists = sp.artists(artist_batch)['artists']
+            
+            # Collect all genres from each artist
+            for artist in artists:
+                if artist['genres']:
+                    all_genres.extend(artist['genres'])
+        
+        offset += batch_size
+        
+        # Check if we've processed all tracks
+        if offset >= results['total']:
+            break
+    
+    return all_genres
+
 def vectorize_genre_list(genre_list, all_unique_genres):
     """
     Converts a list of genres into a weighted vector.
     """
+    assert len(genre_list) > 0
     # Count how many times each genre appears
     genre_counts = Counter(genre_list)
     
@@ -125,20 +215,24 @@ def main():
     df = pd.read_csv("artists.csv")
     prepare_artist_data("final_tracks.csv")
     # Create genre preferences
-    genre_preferences = ['pop', 'pop', 'rock', 'hyperpop_italiano', 'hyperpop_italiano', 'indie pop', 'indie pop', 'uk bass', 'uk bass']
+    playlist_url = "https://open.spotify.com/playlist/2lvECTePT808JzzifupcbT?si=9de723f89db143a6"
+    genre_preferences = get_genres_from_playlist(playlist_url)
+    #genre_preferences = ['pop', 'pop', 'rock', 'hyperpop_italiano', 'hyperpop_italiano', 'indie pop', 'indie pop', 'uk bass', 'uk bass']
     
     try:
         recommendations = recommend_artists(genre_preferences, df)
         
         #results
+        recommendations['recommended_artists_names'] = get_artist_names_from_uris(recommendations['recommended_artists'])
         print("\nRecommended artists:")
-        for artist, distance in zip(recommendations['recommended_artists'], 
+        for artist, distance in zip(recommendations['recommended_artists_names'], 
                                   recommendations['distances']):
-            print(f"Artist URI: {artist}, Distance: {distance:.3f}")
+            
+            print(f"Artist: {artist}, Distance: {distance:.3f}")
 
          #genre info   
         print(f"\nTotal unique genres: {len(recommendations['all_genres'])}")
-        print(f"All genres: {recommendations['all_genres']}")
+        #print(f"All genres: {recommendations['all_genres']}")
 
     except Exception as e:
         print(f"An error occurred: {str(e)}")
