@@ -41,70 +41,6 @@ def get_artist_names_from_uris(artist_uris):
     
     return artist_names
 
-def get_genres_from_playlist(playlist_url: str):
-    """
-    Retrieve all genres from a Spotify playlist through its artists.
-    Returns a list of genres (non-unique to preserve frequency for weighting).
-    
-    Args:
-        playlist_url (str): Full Spotify playlist URL or URI
-        
-    Returns:
-        List[str]: List of all genres (including duplicates)
-    """
-    # Initialize Spotify client
-    client_credentials_manager = SpotifyClientCredentials(
-        client_id=os.environ.get('SPOTIFY_CLIENT_ID'),
-        client_secret=os.environ.get('SPOTIFY_SECRET')
-    )
-    sp = spotipy.Spotify(client_credentials_manager=client_credentials_manager)
-    
-    # Extract playlist ID from URL if needed
-    if 'spotify.com' in playlist_url:
-        playlist_id = playlist_url.split('/')[-1].split('?')[0]
-    else:
-        playlist_id = playlist_url
-    
-    # Get all tracks from playlist
-    all_genres = []
-    offset = 0
-    batch_size = 100  # Spotify API limit for tracks per request
-    
-    while True:
-        # Get batch of tracks
-        results = sp.playlist_tracks(
-            playlist_id,
-            offset=offset,
-            fields='items.track.artists,total',
-            additional_types=['track']
-        )
-        
-        if not results['items']:
-            break
-            
-        # Extract artist IDs from the batch
-        artist_ids = []
-        for item in results['items']:
-            if item['track'] and item['track']['artists']:
-                artist_ids.extend([artist['id'] for artist in item['track']['artists']])
-        
-        # Get artist details in batches of 50 (Spotify API limit)
-        for i in range(0, len(artist_ids), 50):
-            artist_batch = artist_ids[i:i+50]
-            artists = sp.artists(artist_batch)['artists']
-            
-            # Collect all genres from each artist
-            for artist in artists:
-                if artist['genres']:
-                    all_genres.extend(artist['genres'])
-        
-        offset += batch_size
-        
-        # Check if we've processed all tracks
-        if offset >= results['total']:
-            break
-    
-    return all_genres
 
 def vectorize_genre_list(genre_list, all_unique_genres):
     """
@@ -133,9 +69,8 @@ def extract_unique_genres(df):
     all_genres = set()
     
     for genres_list in df['artist_genres']:
-        if isinstance(genres_list, list):
-            all_genres.update(genre.lower().strip() for genre in genres_list if genre)
-    
+        all_genres.update(set(ast.literal_eval(genres_list)))
+
     return sorted(list(all_genres))
 
 def build_artist_genre_profiles(df, all_unique_genres):
@@ -150,6 +85,51 @@ def build_artist_genre_profiles(df, all_unique_genres):
     
     artist_vectors = np.array(list(artist_profiles.values()))
     return artist_profiles, artist_vectors
+
+def create_artist_embeddings(tracks_df, embedding_dim=32):
+    """
+    Create artist embeddings based on their co-occurrence in playlists
+    Using Word2Vec analogy: playlist = sentence, artist = word
+    """
+    from gensim.models import Word2Vec
+    
+    # Convert playlist URIs from string to list
+    tracks_df['playlist_uris'] = tracks_df['playlist_uris'].apply(ast.literal_eval)
+    
+    # Create "sentences" where each sentence is a list of artists in a playlist
+    playlist_artists = {}
+    for _, row in tracks_df.iterrows():
+        artist_uris = ast.literal_eval(row['artists_uris'])
+        for playlist_uri in row['playlist_uris']:
+            if playlist_uri not in playlist_artists:
+                playlist_artists[playlist_uri] = []
+            playlist_artists[playlist_uri].extend(artist_uris)
+    
+    # Train Word2Vec model
+    artist_sequences = list(playlist_artists.values())
+    model = Word2Vec(sentences=artist_sequences, 
+                    vector_size=embedding_dim,
+                    window=5,
+                    min_count=1,
+                    workers=4)
+    
+    return model
+
+def prepare_track_feature_vector(track_row, all_unique_genres):
+    """
+    Creates a feature vector for a track combining:
+    - Genre information (from artists)
+    - Artist embedding (based on co-occurrence in playlists)
+    """
+    # Get genre vector
+    genre_vector = vectorize_genre_list(track_row['artist_genres'], all_unique_genres)
+    
+    features = []
+    
+    # Add genre vector
+    features.extend(genre_vector)
+    
+    return np.array(features)
 
 def recommend_artists(input_genres, artist_df, exclude_artists=None, n_recommendations=5):
     """
@@ -261,53 +241,159 @@ def vectorize_track(track_genres, track_features, all_unique_genres):
     
     return combined_vector
 
-def recommend_tracks(input_genres, tracks_df, sp, n_recommendations=5):
+def recommend_tracks_ml(input_playlist_url, tracks_df, artist_df, n_recommendations=5):
     """
-    Recommends tracks based on input genres and audio features
+    Recommend tracks using a hybrid approach:
+    1. Content-based: genres from input playlist
+    2. Collaborative: artist embeddings
     """
-    # Clean data and get unique genres
-    all_unique_genres = extract_unique_genres(tracks_df)
+    # Initialize Spotify client
+    client_credentials_manager = SpotifyClientCredentials(
+        client_id=os.environ.get('SPOTIFY_CLIENT_ID'),
+        client_secret=os.environ.get('SPOTIFY_SECRET')
+    )
+    sp = spotipy.Spotify(client_credentials_manager=client_credentials_manager)
     
-    # Prepare track vectors
+    print("Starting recommendation process...")
+    
+    # Get genres from input playlist
+    input_genres = get_genres_from_playlist(sp, input_playlist_url)
+    print(f"Found {len(input_genres)} genres in input playlist")
+    
+    # Get all unique genres from artist_df
+    all_unique_genres = extract_unique_genres(artist_df)
+    print(f"Found {len(all_unique_genres)} unique genres in dataset")
+    
+    if not all_unique_genres:
+        raise ValueError("No genres found in the dataset")
+    
+    # Create genre vector from input genres
+    input_genre_vector = vectorize_genre_list(input_genres, all_unique_genres)
+    
+    # Create artist embeddings
+    print("Creating artist embeddings...")
+    artist_embedding_model = create_artist_embeddings(tracks_df)
+    
+    # Prepare feature vectors for all tracks
+    print("Creating track vectors...")
     track_vectors = []
     track_ids = []
     
-    for _, track in tracks_df.iterrows():
-        # Get track features from Spotify API
-        track_features = get_track_features(sp, track['track_uri'].split(':')[-1])
-        if not track_features:
-            continue
+    for idx, track in tracks_df.iterrows():
+        try:
+            # Get track's artists' genres from artist_df
+            artist_uris = ast.literal_eval(track['artists_uris'])
+            track_genres = []
             
-        # Get track's artist genres
-        artist_ids = [artist_uri.split(':')[-1] for artist_uri in ast.literal_eval(track['artist_uris'])]
-        track_genres = []
-        for artist_id in artist_ids:
-            try:
-                artist = sp.artist(artist_id)
-                track_genres.extend(artist['genres'])
-            except:
+            # Collect genres from all artists of the track
+            for artist_uri in artist_uris:
+                artist_data = artist_df[artist_df['artist_uri'] == artist_uri]
+                if not artist_data.empty:
+                    artist_genres = artist_data['artist_genres'].iloc[0]
+                    if isinstance(artist_genres, str):
+                        artist_genres = ast.literal_eval(artist_genres)
+                    track_genres.extend(artist_genres)
+            
+            if not track_genres:
                 continue
-        
-        if not track_genres:
-            continue
             
-        # Create combined feature vector
-        track_vector = vectorize_track(track_genres, track_features, all_unique_genres)
-        track_vectors.append(track_vector)
-        track_ids.append(track['track_uri'])
+            # Create basic feature vector from genres
+            track_vector = vectorize_genre_list(track_genres, all_unique_genres)
+            
+            # Add artist embedding features
+            artist_embeddings = []
+            for artist_uri in artist_uris:
+                if artist_uri in artist_embedding_model.wv:
+                    artist_embeddings.append(artist_embedding_model.wv[artist_uri])
+            
+            if artist_embeddings:
+                avg_artist_embedding = np.mean(artist_embeddings, axis=0)
+                track_vector = np.concatenate([track_vector, avg_artist_embedding])
+                
+                track_vectors.append(track_vector)
+                track_ids.append(track['track_uri'])
+                
+            if idx % 1000 == 0:
+                print(f"Processed {idx} tracks...")
+                
+        except Exception as e:
+            print(f"Error processing track {idx}: {str(e)}")
+            continue
+    
+    if not track_vectors:
+        raise ValueError("No valid track vectors could be created")
+    
+    print(f"Created vectors for {len(track_vectors)} tracks")
     
     # Convert to numpy array
     track_vectors = np.array(track_vectors)
     
-    # Create input vector (using first track's features as reference)
-    input_features = get_track_features(sp, track_ids[0].split(':')[-1])
-    input_vector = vectorize_track(input_genres, input_features, all_unique_genres)
+    # Create input vector combining genre preferences and playlist context
+    input_vector = np.zeros_like(track_vectors[0])
     
-    # Find nearest neighbors
+    # Get tracks from input playlist for context
+    playlist_tracks = get_playlist_tracks(sp, input_playlist_url)
+    
+    # Average the vectors of tracks in the input playlist
+    playlist_vectors = []
+    for track in playlist_tracks:
+        try:
+            matching_tracks = tracks_df[tracks_df['track_uri'] == track['track_uri']]
+            if matching_tracks.empty:
+                continue
+                
+            track_data = matching_tracks.iloc[0]
+            artist_uris = ast.literal_eval(track_data['artists_uris'])
+            track_genres = []
+            
+            # Collect genres from all artists of the track
+            for artist_uri in artist_uris:
+                artist_data = artist_df[artist_df['artist_uri'] == artist_uri]
+                if not artist_data.empty:
+                    artist_genres = artist_data['artist_genres'].iloc[0]
+                    if isinstance(artist_genres, str):
+                        artist_genres = ast.literal_eval(artist_genres)
+                    track_genres.extend(artist_genres)
+            
+            if not track_genres:
+                continue
+            
+            track_vector = vectorize_genre_list(track_genres, all_unique_genres)
+            
+            # Add artist embedding
+            artist_embeddings = []
+            for artist_uri in artist_uris:
+                if artist_uri in artist_embedding_model.wv:
+                    artist_embeddings.append(artist_embedding_model.wv[artist_uri])
+            
+            if artist_embeddings:
+                avg_artist_embedding = np.mean(artist_embeddings, axis=0)
+                track_vector = np.concatenate([track_vector, avg_artist_embedding])
+                playlist_vectors.append(track_vector)
+                
+        except Exception as e:
+            print(f"Error processing playlist track: {str(e)}")
+            continue
+    
+    # Combine genre preferences with playlist context
+    if playlist_vectors:
+        playlist_context_vector = np.mean(playlist_vectors, axis=0)
+        genre_weight = 0.6
+        context_weight = 0.4
+        input_vector = (genre_weight * playlist_context_vector + 
+                       context_weight * np.concatenate([input_genre_vector, 
+                                                      np.zeros(len(playlist_context_vector) - len(input_genre_vector))]))
+    else:
+        input_vector = np.concatenate([input_genre_vector, 
+                                     np.zeros(len(track_vectors[0]) - len(input_genre_vector))])
+    
+    # Use KNN with cosine similarity
+    print("Finding nearest neighbors...")
     n_neighbors = min(len(track_vectors), max(n_recommendations * 2, 5))
     knn = NearestNeighbors(n_neighbors=n_neighbors, metric='cosine')
     knn.fit(track_vectors)
     
+    # Get recommendations
     distances, indices = knn.kneighbors([input_vector])
     
     recommended_tracks = []
@@ -322,8 +408,7 @@ def recommend_tracks(input_genres, tracks_df, sp, n_recommendations=5):
     
     return {
         'recommended_tracks': recommended_tracks,
-        'distances': recommendation_distances,
-        'all_genres': all_unique_genres
+        'distances': recommendation_distances
     }
 
 def get_track_names_from_uris(track_uris, sp):
@@ -346,35 +431,57 @@ def get_track_names_from_uris(track_uris, sp):
 
 
 def main():
-    # Load the dataset
+    # Initialize Spotify client
+    client_credentials_manager = SpotifyClientCredentials(
+        client_id=os.environ.get('SPOTIFY_CLIENT_ID'),
+        client_secret=os.environ.get('SPOTIFY_SECRET')
+    )
+    sp = spotipy.Spotify(client_credentials_manager=client_credentials_manager)
     
-    df = pd.read_csv("artists.csv")
-    prepare_artist_data("final_tracks.csv")
-    # Create genre preferences
+    # Load datasets
+    artist_df = pd.read_csv("artists.csv")
+    tracks_df = pd.read_csv("final_tracks.csv")
+    
+    # Input playlist URL
     playlist_url = "https://open.spotify.com/playlist/2lvECTePT808JzzifupcbT?si=9de723f89db143a6"
-    genre_preferences = get_genres_from_playlist(playlist_url)
-    #genre_preferences = ['pop', 'pop', 'rock', 'hyperpop_italiano', 'hyperpop_italiano', 'indie pop', 'indie pop', 'uk bass', 'uk bass']
+    
+    # User can choose between artist or track recommendations
+    recommendation_type = "tracks"  # or "artists"
     
     try:
-        recommendations = recommend_artists(genre_preferences, df)
-        
-        #results
-        recommendations['recommended_artists_names'] = get_artist_names_from_uris(recommendations['recommended_artists'])
-        print("\nRecommended artists:")
-        for artist, distance in zip(recommendations['recommended_artists_names'], 
-                                  recommendations['distances']):
+        if recommendation_type == "artists":
+            # Get genre preferences from playlist
+            genre_preferences = get_genres_from_playlist(sp, playlist_url)
+            recommendations = recommend_artists(genre_preferences, artist_df)
             
-            print(f"Artist: {artist}, Distance: {distance:.3f}")
-
-         #genre info   
-        print(f"\nTotal unique genres: {len(recommendations['all_genres'])}")
-        #print(f"All genres: {recommendations['all_genres']}")
+            # Get artist names for display
+            artist_names = get_artist_names_from_uris(sp, recommendations['recommended_artists'])
+            
+            print("\nRecommended artists:")
+            for artist, distance in zip(artist_names, recommendations['distances']):
+                print(f"Artist: {artist}, Distance: {distance:.3f}")
+            
+            print(f"\nTotal unique genres considered: {len(recommendations['all_genres'])}")
+            
+        else:  # tracks
+            print("\nGenerating track recommendations based on playlist analysis...")
+            recommendations = recommend_tracks_ml(playlist_url, tracks_df, artist_df)
+            
+            # Get track info for display
+            track_info = get_track_names_from_uris(recommendations['recommended_tracks'], sp)
+            
+            print("\nRecommended tracks:")
+            for info, distance in zip(track_info, recommendations['distances']):
+                print(f"Track: {info['name']} by {info['artists']}, Distance: {distance:.3f}")
+            
+            print("\nRecommendation based on:")
+            print("- Genre analysis")
+            print("- Artist co-occurrence patterns")
+            print("- Playlist context")
 
     except Exception as e:
-        print(f"An error occurred: {str(e)}")
-        print("\nDataset preview:")
-        print(df.head())
-        print("\nColumns:", df.columns.tolist())
+        print(f"An error occurred: {e}")
+        raise e
 
 if __name__ == "__main__":
     main()

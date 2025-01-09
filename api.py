@@ -130,3 +130,35 @@ def get_genres_from_playlist(sp: spotipy.Spotify, playlist_url: str):
             break
     
     return all_genres
+
+
+def get_playlist_tracks(sp: spotipy.Spotify, playlist_url: str):
+    """
+    Get all tracks from a playlist
+    """
+    
+    if 'spotify.com' in playlist_url:
+        playlist_id = playlist_url.split('/')[-1].split('?')[0]
+    else:
+        playlist_id = playlist_url
+        
+    tracks = []
+    offset = 0
+    
+    while True:
+        results = sp.playlist_tracks(playlist_id, offset=offset)
+        if not results['items']:
+            break
+            
+        for item in results['items']:
+            if item['track']:
+                tracks.append({
+                    'track_uri': f"spotify:track:{item['track']['id']}",
+                    'artist_uris': [f"spotify:artist:{artist['id']}" for artist in item['track']['artists']]
+                })
+                
+        offset += len(results['items'])
+        if offset >= results['total']:
+            break
+            
+    return tracks
