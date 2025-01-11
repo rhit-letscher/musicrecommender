@@ -23,7 +23,6 @@ def clean(df):
 
 def get_artist_names_from_uris(artist_uris):
     # Initialize Spotify client
-    # You'll need to set up your credentials at https://developer.spotify.com/dashboard
     client_credentials_manager = SpotifyClientCredentials(
         client_id=os.environ.get('SPOTIFY_CLIENT_ID'),
         client_secret=os.environ.get('SPOTIFY_SECRET')
@@ -115,22 +114,6 @@ def create_artist_embeddings(tracks_df, embedding_dim=32):
     
     return model
 
-def prepare_track_feature_vector(track_row, all_unique_genres):
-    """
-    Creates a feature vector for a track combining:
-    - Genre information (from artists)
-    - Artist embedding (based on co-occurrence in playlists)
-    """
-    # Get genre vector
-    genre_vector = vectorize_genre_list(track_row['artist_genres'], all_unique_genres)
-    
-    features = []
-    
-    # Add genre vector
-    features.extend(genre_vector)
-    
-    return np.array(features)
-
 def recommend_artists(input_genres, artist_df, exclude_artists=None, n_recommendations=5):
     """
     Recommends artists based on input genres.
@@ -191,55 +174,6 @@ def prepare_artist_data(filename):
 
     #todo: for each artist url, query spotify api and get genre list. add to new column ['genres']
 
-def get_track_features(sp, track_id):
-    """
-    Get audio features and basic track info from Spotify API
-    """
-    try:
-        # Get audio features
-        audio_features = sp.audio_features([track_id])[0]
-        # Get track info including popularity
-        track_info = sp.track(track_id)
-        
-        if audio_features:
-            relevant_features = {
-                'danceability': audio_features['danceability'],
-                'energy': audio_features['energy'],
-                'valence': audio_features['valence'],
-                'tempo': audio_features['tempo'],
-                'popularity': track_info['popularity'] / 100.0  # Normalize to 0-1 range
-            }
-            return relevant_features
-    except:
-        return None
-    
-def vectorize_track(track_genres, track_features, all_unique_genres):
-    """
-    Creates a feature vector combining genres and audio features
-    """
-    # Get genre vector (using your existing vectorize_genre_list function)
-    genre_vector = vectorize_genre_list(track_genres, all_unique_genres)
-    
-    # Create feature vector from audio features
-    feature_vector = np.array([
-        track_features['danceability'],
-        track_features['energy'],
-        track_features['valence'],
-        track_features['tempo'] / 200.0,  # Normalize tempo
-        track_features['popularity']
-    ])
-    
-    # Combine genre and feature vectors
-    # You can adjust these weights based on importance
-    genre_weight = 0.7
-    features_weight = 0.3
-    
-    combined_vector = np.concatenate([
-        genre_vector * genre_weight,
-        feature_vector * features_weight
-    ])
-    
-    return combined_vector
 
 def recommend_tracks_ml(input_playlist_url, tracks_df, artist_df, n_recommendations=5):
     """
